@@ -1,0 +1,28 @@
+{
+  "name": "youtube-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "YouTube Subtitles to Markdown MCP Server",
+  "main": "build/index.js",
+  "scripts": {
+    "build": "tsc && chmod +x build/index.js",
+    "start": "node build/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "googleapis": "^146.0.0",
+    "google-auth-library": "^9.0.0",
+    "youtube-captions-scraper": "^2.0.0",
+    "express": "^4.18.2",
+    "open": "^9.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "tsx": "^4.0.0"
+  },
+  "keywords": ["mcp", "youtube", "captions", "subtitles", "markdown"],
+  "author": "",
+  "license": "MIT"
+}
