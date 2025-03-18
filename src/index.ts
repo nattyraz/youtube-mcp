@@ -1,187 +1,275 @@
-#!/usr/bin/env node
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListResourcesRequestSchema,
-  ListResourceTemplatesRequestSchema,
-  ListToolsRequestSchema,
-  McpError,
-  ReadResourceRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
-import { google } from 'googleapis';
-import { OAuth2Client } from 'google-auth-library';
-import * as youtubeCaptions from 'youtube-captions-scraper';
-import {
-  Caption,
-  ErrorCode,
-  GetVideoInfoArgs,
-  GetCaptionsArgs,
-  ConvertToMarkdownArgs,
-  VideoOptions
-} from './types.js';
 
-interface MarkdownTemplate {
-  name: string;
-  description: string;
-  format: {
-    header?: string;
-    chapter_format?: string;
-    caption_block: string;
-    timestamp_format?: string;
-    search_result_format?: string;
-  }
-}
-
-interface Config {
-  oauth2Client: OAuth2Client;
-  supported_languages: string[];
-  templates: {
-    default: string;
-    custom: MarkdownTemplate[];
-  };
-  search: {
-    context_lines: number;
-    highlight_format: string;
-  };
-  cache: {
-    enabled: boolean;
-    ttl: number;
-  }
-}
-
-const DEFAULT_TEMPLATES: MarkdownTemplate[] = [
-  {
-    name: "basic",
-    description: "Simple transcript format",
-    format: {
-      caption_block: "{text}\n"
-    }
-  },
-  {
-    name: "detailed",
-    description: "Detailed format with metadata",
-    format: {
-      header: "# {video_title}\nChannel: {channel_name}\nPublished: {publish_date}\n\n",
-      chapter_format: "## {chapter_title}\n",
-      caption_block: "{text}\n",
-      timestamp_format: "[{timestamp}] "
-    }
-  },
-  {
-    name: "search",
-    description: "Search results format",
-    format: {
-      header: "# Search Results for \"{search_term}\"\nVideo: {video_title}\n\n",
-      search_result_format: "- [{timestamp}] {text}\n",
-      caption_block: "{text}\n"
-    }
-  }
-];
-
-class YouTubeMcpServer {
-  private server: Server;
-  private youtube;
-  private config: Config;
-
-  constructor() {
-    let auth;
-    
-    // Initialize OAuth2 client for operations that need it
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.YOUTUBE_CLIENT_ID,
-      process.env.YOUTUBE_CLIENT_SECRET
-    );
-
-    if (process.env.YOUTUBE_REFRESH_TOKEN) {
-      oauth2Client.setCredentials({
-        refresh_token: process.env.YOUTUBE_REFRESH_TOKEN
-      });
-      auth = oauth2Client;
-    } else if (process.env.YOUTUBE_API_KEY) {
-      // Fall back to API key if OAuth is not configured
-      auth = process.env.YOUTUBE_API_KEY;
-    } else {
-      console.warn('No YouTube authentication configured. Operations may fail.');
-    }
-
-    this.youtube = google.youtube({
-      version: 'v3',
-      auth
-    });
-    
-    this.config = {
-      oauth2Client,
-      supported_languages: ['en', 'fr'],
-      templates: {
-        default: 'basic',
-        custom: DEFAULT_TEMPLATES
-      },
-      search: {
-        context_lines: 2,
-        highlight_format: "**{text}**"
-      },
-      cache: {
-        enabled: true,
-        ttl: 3600
-      }
-    };
-
-    this.server = new Server(
-      {
-        name: 'youtube-mcp-server',
-        version: '0.1.0',
-      },
-      {
-        capabilities: {
-          resources: {},
-          tools: {},
+  private setupToolHandlers() {
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: [
+        {
+          name: 'get_video_info',
+          description: 'Get video metadata including available captions, chapters, and languages',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: {
+                type: 'string',
+                description: 'YouTube video URL'
+              }
+            },
+            required: ['url']
+          }
         },
+        {
+          name: 'get_captions',
+          description: 'Get captions for a video in specified language',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: {
+                type: 'string',
+                description: 'YouTube video URL'
+              },
+              language: {
+                type: 'string',
+                description: 'Language code (e.g., en, fr)'
+              }
+            },
+            required: ['url']
+          }
+        },
+        {
+          name: 'convert_to_markdown',
+          description: 'Convert video captions to markdown',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: {
+                type: 'string',
+                description: 'YouTube video URL'
+              },
+              template_name: {
+                type: 'string',
+                description: 'Template name to use'
+              },
+              language: {
+                type: 'string',
+                description: 'Language code'
+              },
+              options: {
+                type: 'object',
+                properties: {
+                  include_chapters: {
+                    type: 'boolean'
+                  },
+                  search_term: {
+                    type: 'string'
+                  }
+                }
+              }
+            },
+            required: ['url']
+          }
+        },
+        {
+          name: 'list_templates',
+          description: 'List available markdown templates',
+          inputSchema: {
+            type: 'object',
+            properties: {}
+          }
+        }
+      ]
+    }));
+
+    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      if (!request.params.arguments) {
+        throw new McpError(ErrorCode.InvalidRequest, 'Missing arguments');
       }
-    );
 
-    this.setupToolHandlers();
-    this.setupResourceHandlers();
-    
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
+      const args = request.params.arguments as Record<string, unknown>;
+
+      switch (request.params.name) {
+        case 'get_video_info': {
+          if (typeof args.url !== 'string') {
+            throw new McpError(ErrorCode.InvalidRequest, 'URL is required and must be a string');
+          }
+          const validatedArgs: GetVideoInfoArgs = { url: args.url };
+          const videoId = this.extractVideoId(validatedArgs.url);
+          const info = await this.getVideoInfo(videoId);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(info, null, 2)
+            }]
+          };
+        }
+
+        case 'get_captions': {
+          if (typeof args.url !== 'string') {
+            throw new McpError(ErrorCode.InvalidRequest, 'URL is required and must be a string');
+          }
+          const validatedArgs: GetCaptionsArgs = {
+            url: args.url,
+            language: typeof args.language === 'string' ? args.language : undefined
+          };
+          const videoId = this.extractVideoId(validatedArgs.url);
+          const captions = await this.getCaptions(videoId, validatedArgs.language);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(captions, null, 2)
+            }]
+          };
+        }
+
+        case 'convert_to_markdown': {
+          if (typeof args.url !== 'string') {
+            throw new McpError(ErrorCode.InvalidRequest, 'URL is required and must be a string');
+          }
+          
+          const validatedArgs: ConvertToMarkdownArgs = {
+            url: args.url,
+            template_name: typeof args.template_name === 'string' ? args.template_name : undefined,
+            language: typeof args.language === 'string' ? args.language : undefined,
+            options: typeof args.options === 'object' && args.options ? {
+              include_chapters: typeof (args.options as Record<string, unknown>).include_chapters === 'boolean' 
+                ? (args.options as Record<string, unknown>).include_chapters as boolean
+                : false,
+              search_term: typeof (args.options as Record<string, unknown>).search_term === 'string'
+                ? (args.options as Record<string, unknown>).search_term as string
+                : undefined
+            } : undefined
+          };
+          
+          const videoId = this.extractVideoId(validatedArgs.url);
+          const templateName = validatedArgs.template_name || this.config.templates.default;
+          const language = validatedArgs.language || 'en';
+          const options = validatedArgs.options || { include_chapters: false };
+
+          const template = this.config.templates.custom.find(t => t.name === templateName);
+          if (!template) {
+            throw new McpError(ErrorCode.InvalidRequest, `Template '${templateName}' not found`);
+          }
+
+          const [videoInfo, captions] = await Promise.all([
+            this.getVideoInfo(videoId),
+            this.getCaptions(videoId, language)
+          ]);
+
+          let markdown = '';
+
+          // Add header if template has one
+          if (template.format.header) {
+            markdown += template.format.header
+              .replace('{video_title}', videoInfo.snippet?.title || '')
+              .replace('{channel_name}', videoInfo.snippet?.channelTitle || '')
+              .replace('{publish_date}', videoInfo.snippet?.publishedAt || '');
+          }
+
+          // Process captions
+          if (options.search_term) {
+            const searchRegex = new RegExp(options.search_term, 'gi');
+            const matches = captions.filter((caption: Caption) => searchRegex.test(caption.text));
+            
+            matches.forEach((match: Caption) => {
+              markdown += template.format.search_result_format!
+                .replace('{timestamp}', match.start)
+                .replace('{text}', match.text.replace(searchRegex, (m: string) => `**${m}**`));
+            });
+          } else {
+            captions.forEach((caption: Caption) => {
+              let text = template.format.caption_block.replace('{text}', caption.text);
+              if (template.format.timestamp_format) {
+                text = template.format.timestamp_format.replace('{timestamp}', caption.start) + text;
+              }
+              markdown += text;
+            });
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: markdown
+            }]
+          };
+        }
+
+        case 'list_templates': {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(this.config.templates.custom, null, 2)
+            }]
+          };
+        }
+
+        default:
+          throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+      }
+    });
   }
 
-  private extractVideoId(url: string): string {
-    const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i;
-    const match = url.match(regex);
-    if (!match) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Invalid YouTube URL');
-    }
-    return match[1];
-  }
+  private setupResourceHandlers() {
+    this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+      resourceTemplates: [
+        {
+          uriTemplate: 'youtube://{video_id}/info',
+          name: 'Video metadata',
+          description: 'Access video metadata and chapters',
+          mimeType: 'application/json'
+        },
+        {
+          uriTemplate: 'youtube://{video_id}/captions/{lang}',
+          name: 'Video captions',
+          description: 'Access processed captions for specific language',
+          mimeType: 'application/json'
+        }
+      ]
+    }));
 
-  private async getVideoInfo(videoId: string) {
-    try {
-      const response = await this.youtube.videos.list({
-        part: ['snippet', 'contentDetails'],
-        id: [videoId]
-      });
-
-      if (!response.data.items?.length) {
-        throw new McpError(ErrorCode.NotFound, 'Video not found');
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const match = request.params.uri.match(/^youtube:\/\/([^\/]+)\/([^\/]+)(?:\/([^\/]+))?$/);
+      if (!match) {
+        throw new McpError(ErrorCode.InvalidRequest, `Invalid URI format: ${request.params.uri}`);
       }
 
-      return response.data.items[0];
-    } catch (error) {
-      console.error('Error fetching video info:', error);
-      throw new McpError(ErrorCode.InternalError, 'Failed to fetch video info');
-    }
+      const [_, videoId, type, lang] = match;
+
+      switch (type) {
+        case 'info': {
+          const info = await this.getVideoInfo(videoId);
+          return {
+            contents: [{
+              uri: request.params.uri,
+              mimeType: 'application/json',
+              text: JSON.stringify(info, null, 2)
+            }]
+          };
+        }
+
+        case 'captions': {
+          if (!lang) {
+            throw new McpError(ErrorCode.InvalidRequest, 'Language code required for captions');
+          }
+          const captions = await this.getCaptions(videoId, lang);
+          return {
+            contents: [{
+              uri: request.params.uri,
+              mimeType: 'application/json',
+              text: JSON.stringify(captions, null, 2)
+            }]
+          };
+        }
+
+        default:
+          throw new McpError(ErrorCode.InvalidRequest, `Unknown resource type: ${type}`);
+      }
+    });
   }
 
-  private async getCaptions(videoId: string, language?: string) {
-    try {
-      const captions = await youtubeCaptions.getSubtitles({
-        videoID: videoId,
-        lang: language || 'en'
-      });
-      return captions;
-    } catch (error) {
-      console.error('Error fetching captions:', error);
-      throw new McpError(ErrorCode.InternalError, 'Failed to fetch captions');
-    }
+  async run() {
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+    console.error('YouTube MCP server running on stdio');
   }
+}
+
+const server = new YouTubeMcpServer();
+server.run().catch(console.error);
