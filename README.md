@@ -2,6 +2,10 @@
 
 A Model Context Protocol (MCP) server for interacting with YouTube videos. This server provides tools for extracting video metadata, captions, and converting them to markdown format with various templates.
 
+<a href="https://glama.ai/mcp/servers/@nattyraz/youtube-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@nattyraz/youtube-mcp/badge" alt="YouTube Server MCP server" />
+</a>
+
 ## Features
 
 - **Video Metadata**: Fetch comprehensive video information
